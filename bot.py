@@ -56,14 +56,13 @@ def check_target(tcin):
         r = requests.get(url, headers=get_headers(json=True), timeout=15)
         data = r.json()
         product_data = data.get("data", {}).get("product", {})
-
-        # Safe lookup — handles API structure changes
         fulfillment = (
             product_data.get("fulfillment") or
             product_data.get("enrichment", {}).get("fulfillment", {})
         )
         avail = (fulfillment or {}).get("shipping_options", {}).get("availability_status", "")
-
+        if not avail:
+            print(f"    [DEBUG] Target raw response (500 chars): {str(data)[:500]}")
         if avail == "IN_STOCK":
             return "IN STOCK"
         elif avail in ["OUT_STOCK", "OUT_GRID", "UNAVAILABLE"]:
@@ -80,6 +79,8 @@ def check_walmart(item_id):
         r = requests.get(url, headers=get_headers(json=True), timeout=15)
         data = r.json()
         status = data.get("raw", {}).get("status", "")
+        if not status:
+            print(f"    [DEBUG] Walmart raw response (500 chars): {str(data)[:500]}")
         if "AVAILABLE" in status.upper():
             return "IN STOCK"
         if "NOT_AVAILABLE" in status.upper() or "OUT" in status.upper():
@@ -98,6 +99,7 @@ def check_gamestop(full_url):
             return "IN STOCK"
         if "out of stock" in content or "sold out" in content or "exclusively in stores" in content:
             return "OUT OF STOCK"
+        print(f"    [DEBUG] GameStop response snippet: {content[:500]}")
         return "UNKNOWN"
     except Exception as e:
         print(f"    [ERROR] GameStop: {e}")
