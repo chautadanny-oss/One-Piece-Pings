@@ -3,67 +3,100 @@ import time
 import json
 import os
 import hashlib
+import random
 from datetime import datetime
 
 # ============================================================
-# ONEPIECEPINGS BOT v2.0
-# Uses retailer APIs directly instead of scraping HTML
-# This is how real monitor bots work — faster and more reliable
-# Crew gets instant alerts, Free members get alert 30 mins later
+# ONEPIECEPINGS BOT v3.1
+# - Safe API lookups (no more crashes)
+# - Walmart mobile API (bypasses anti-bot)
+# - Rotating user agents (avoids IP bans)
+# - Atomic state saving (no corruption)
+# - Discord rate limit handling
+# - Free alert only fires if item is STILL in stock at 30 min
+# - GameStop uses full absolute URLs (no 404s)
+# - Amazon Host header for better browser mimicry
+# - Runs 24/7 on GitHub Actions for free
 # ============================================================
 
 CREW_WEBHOOK = os.environ.get("CREW_WEBHOOK", "")
 FREE_WEBHOOK = os.environ.get("FREE_WEBHOOK", "")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+# --- ROTATING USER AGENTS ---
+# Looks like a different device every run — harder to block
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+]
+
+def get_headers(json=False):
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/plain, */*" if json else "text/html,application/xhtml+xml,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
 
 # ============================================================
-# PRODUCTS LIST
-# Each product has a custom check_fn that hits the right API
-# To add a new product just copy a block and update the IDs
+# RETAILER CHECK FUNCTIONS
 # ============================================================
 
 def check_target(tcin):
-    """Target's internal API — returns real stock data"""
-    url = f"https://redsky.target.com/redsky_aggregations/v1/web/pdp_client_v1?key=9f36aeafbe60771e321a7cc95a78140772ab3e96&tcin={tcin}&pricing_store_id=3991"
+    """Target internal API with safe key lookups"""
+    url = (
+        f"https://redsky.target.com/redsky_aggregations/v1/web/pdp_client_v1"
+        f"?key=9f36aeafbe60771e321a7cc95a78140772ab3e96&tcin={tcin}&pricing_store_id=3991"
+    )
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        r = requests.get(url, headers=get_headers(json=True), timeout=15)
         data = r.json()
-        avail = data["data"]["product"]["fulfillment"]["shipping_options"]["availability_status"]
-        return "IN STOCK" if avail == "IN_STOCK" else "OUT OF STOCK"
+        product_data = data.get("data", {}).get("product", {})
+
+        # Safe lookup — handles API structure changes
+        fulfillment = (
+            product_data.get("fulfillment") or
+            product_data.get("enrichment", {}).get("fulfillment", {})
+        )
+        avail = (fulfillment or {}).get("shipping_options", {}).get("availability_status", "")
+
+        if avail == "IN_STOCK":
+            return "IN STOCK"
+        elif avail in ["OUT_STOCK", "OUT_GRID", "UNAVAILABLE"]:
+            return "OUT OF STOCK"
+        return "UNKNOWN"
     except Exception as e:
-        print(f"    [ERROR] Target API: {e}")
+        print(f"    [ERROR] Target: {e}")
         return "UNKNOWN"
 
 def check_walmart(item_id):
-    """Walmart's internal API"""
-    url = f"https://www.walmart.com/ip/{item_id}"
-    headers = {**HEADERS, "Accept": "text/html"}
+    """Walmart mobile API — bypasses anti-bot walls"""
+    url = f"https://www.walmart.com/api/product/v3/prices-availability?itemIds={item_id}"
     try:
-        r = requests.get(url, headers=headers, timeout=15)
-        content = r.text.lower()
-        if '"availabilitystatustype":"available"' in content or '"availability":"in_stock"' in content:
+        r = requests.get(url, headers=get_headers(json=True), timeout=15)
+        data = r.json()
+        status = data.get("raw", {}).get("status", "")
+        if "AVAILABLE" in status.upper():
             return "IN STOCK"
-        if '"availabilitystatustype":"not_available"' in content or "out of stock" in content:
+        if "NOT_AVAILABLE" in status.upper() or "OUT" in status.upper():
             return "OUT OF STOCK"
         return "UNKNOWN"
     except Exception as e:
         print(f"    [ERROR] Walmart: {e}")
         return "UNKNOWN"
 
-def check_gamestop(product_id):
-    """GameStop product availability"""
-    url = f"https://www.gamestop.com/toys-games/trading-cards/products/{product_id}.html"
+def check_gamestop(full_url):
+    """GameStop HTML check — uses full absolute URL directly"""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        r = requests.get(full_url, headers=get_headers(), timeout=15)
         content = r.text.lower()
-        if "add to cart" in content and "out of stock" not in content:
+        if "add to cart" in content and "out of stock" not in content and "exclusively in stores" not in content:
             return "IN STOCK"
-        if "out of stock" in content or "sold out" in content or "exclusively in stores" in content.lower():
+        if "out of stock" in content or "sold out" in content or "exclusively in stores" in content:
             return "OUT OF STOCK"
         return "UNKNOWN"
     except Exception as e:
@@ -71,10 +104,12 @@ def check_gamestop(product_id):
         return "UNKNOWN"
 
 def check_amazon(asin):
-    """Amazon product page"""
+    """Amazon product page with host header for better browser mimicry"""
     url = f"https://www.amazon.com/dp/{asin}"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        headers = get_headers()
+        headers["Host"] = "www.amazon.com"
+        r = requests.get(url, headers=headers, timeout=15)
         content = r.text.lower()
         if "add to cart" in content or "buy now" in content:
             return "IN STOCK"
@@ -87,9 +122,7 @@ def check_amazon(asin):
 
 # ============================================================
 # PRODUCTS TO MONITOR
-# tcin = Target's product ID (found in the URL after /A-)
-# item_id = Walmart's product ID (found in the URL after /ip/)
-# asin = Amazon's product ID (found in URL after /dp/)
+# Add new products by copying any block and updating the ID
 # ============================================================
 
 PRODUCTS = [
@@ -125,7 +158,7 @@ PRODUCTS = [
         "check": lambda: check_amazon("B0F85QYZJ6"),
     },
     {
-        "name": "BANDAI OP-10 One Piece Royal Blood Booster Box 24 Packs",
+        "name": "BANDAI OP-10 One Piece Royal Blood Booster Box",
         "retailer": "Amazon",
         "price": "$44.99",
         "url": "https://www.amazon.com/dp/B0DDWZWW1Z",
@@ -154,38 +187,47 @@ PRODUCTS = [
         "retailer": "GameStop",
         "price": "$44.99",
         "url": "https://www.gamestop.com/toys-games/trading-cards/products/one-piece-trading-card-game-legacy-of-the-master-booster-box-op-12-24-boosters/20026856.html",
-        "check": lambda: check_gamestop("one-piece-trading-card-game-legacy-of-the-master-booster-box-op-12-24-boosters/20026856"),
+        "check": lambda: check_gamestop("https://www.gamestop.com/toys-games/trading-cards/products/one-piece-trading-card-game-legacy-of-the-master-booster-box-op-12-24-boosters/20026856.html"),
     },
     {
         "name": "One Piece TCG: Fist of Divine Speed Booster Box (OP-11)",
         "retailer": "GameStop",
         "price": "$44.99",
         "url": "https://www.gamestop.com/toys-games/trading-cards/products/one-piece-card-game-fist-of-divine-speed-booster-box-op-11/20023052.html",
-        "check": lambda: check_gamestop("one-piece-card-game-fist-of-divine-speed-booster-box-op-11/20023052"),
+        "check": lambda: check_gamestop("https://www.gamestop.com/toys-games/trading-cards/products/one-piece-card-game-fist-of-divine-speed-booster-box-op-11/20023052.html"),
     },
 ]
 
 # ============================================================
-# STATE MANAGEMENT
+# STATE MANAGEMENT — atomic save, no corruption
 # ============================================================
 
 STATE_FILE = "state.json"
 
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[WARNING] Could not load state: {e} — starting fresh")
     return {}
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    """Atomic write — writes temp file first, then replaces. Prevents corruption."""
+    temp_file = "state_temp.json"
+    try:
+        with open(temp_file, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(temp_file, STATE_FILE)
+    except Exception as e:
+        print(f"[CRITICAL] Failed to save state: {e}")
 
 def get_product_id(product):
     return hashlib.md5(f"{product['retailer']}-{product['name']}".encode()).hexdigest()
 
 # ============================================================
-# DISCORD ALERTS
+# DISCORD ALERTS — with rate limit handling
 # ============================================================
 
 def send_webhook(webhook_url, payload):
@@ -196,6 +238,16 @@ def send_webhook(webhook_url, payload):
         r = requests.post(webhook_url, json=payload, timeout=10)
         if r.status_code in [200, 204]:
             print(f"    [✅] Alert sent")
+        elif r.status_code == 429:
+            # Discord rate limit — wait and retry once
+            retry_after = r.json().get("retry_after", 5)
+            print(f"    [⚠️] Rate limited — waiting {retry_after}s then retrying")
+            time.sleep(retry_after)
+            r2 = requests.post(webhook_url, json=payload, timeout=10)
+            if r2.status_code in [200, 204]:
+                print(f"    [✅] Alert sent after retry")
+            else:
+                print(f"    [ERROR] Retry failed: {r2.status_code}")
         else:
             print(f"    [⚠️] Webhook error: {r.status_code}")
     except Exception as e:
@@ -250,7 +302,7 @@ def build_free_alert(product):
 
 def run_once():
     print("=" * 50)
-    print("  OnePiecePings Bot 🏴‍☠️")
+    print("  OnePiecePings Bot v3.1 🏴‍☠️")
     print(f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 50)
 
@@ -271,11 +323,14 @@ def run_once():
             state[f"{pid}_free_send_at"] = time.time() + (30 * 60)
             print(f"  [⏳] Free alert queued for 30 minutes")
 
-        # Send pending free alert if due
+        # Send pending free alert if due — only if item is STILL in stock
         free_send_at = state.get(f"{pid}_free_send_at")
         if free_send_at and time.time() >= float(free_send_at):
-            print(f"  [📢] Sending free alert...")
-            send_webhook(FREE_WEBHOOK, build_free_alert(product))
+            if status == "IN STOCK":
+                print(f"  [📢] Item still in stock — sending free alert...")
+                send_webhook(FREE_WEBHOOK, build_free_alert(product))
+            else:
+                print(f"  [⏳] Free alert cancelled — item sold out before 30 min mark")
             del state[f"{pid}_free_send_at"]
 
         state[pid] = status
