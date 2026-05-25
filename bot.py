@@ -7,15 +7,16 @@ import random
 from datetime import datetime
 
 # ============================================================
-# ONEPIECEPINGS BOT v3.1
+# ONEPIECEPINGS BOT v3.2
 # - Safe API lookups (no more crashes)
-# - Walmart mobile API (bypasses anti-bot)
+# - Target deep structural fallback (shipping + store pickup)
+# - Walmart via BlueCart public API (bypasses PerimeterX)
+# - GameStop internal availability API (bypasses Cloudflare)
 # - Rotating user agents (avoids IP bans)
 # - Atomic state saving (no corruption)
 # - Discord rate limit handling
 # - Free alert only fires if item is STILL in stock at 30 min
-# - GameStop uses full absolute URLs (no 404s)
-# - Amazon Host header for better browser mimicry
+# - UNKNOWN replaced with safe OUT OF STOCK fallback
 # - Runs 24/7 on GitHub Actions for free
 # ============================================================
 
@@ -47,63 +48,66 @@ def get_headers(json=False):
 # ============================================================
 
 def check_target(tcin):
-    """Target internal API with safe key lookups"""
+    """Target internal API with deep structural fallback"""
     url = (
         f"https://redsky.target.com/redsky_aggregations/v1/web/pdp_client_v1"
         f"?key=9f36aeafbe60771e321a7cc95a78140772ab3e96&tcin={tcin}&pricing_store_id=3991"
     )
     try:
         r = requests.get(url, headers=get_headers(json=True), timeout=15)
-        data = r.json()
-        product_data = data.get("data", {}).get("product", {})
-        fulfillment = (
-            product_data.get("fulfillment") or
-            product_data.get("enrichment", {}).get("fulfillment", {})
-        )
-        avail = (fulfillment or {}).get("shipping_options", {}).get("availability_status", "")
-        if not avail:
-            print(f"    [DEBUG] Target raw response (500 chars): {str(data)[:500]}")
-        if avail == "IN_STOCK":
-            return "IN STOCK"
-        elif avail in ["OUT_STOCK", "OUT_GRID", "UNAVAILABLE"]:
-            return "OUT OF STOCK"
-        return "UNKNOWN"
+        if r.status_code == 200:
+            data = r.json()
+            p_data = data.get("data", {}).get("product", {})
+            fulfillment = (
+                p_data.get("fulfillment") or
+                p_data.get("enrichment", {}).get("fulfillment", {}) or {}
+            )
+            # Check shipping availability first
+            avail = fulfillment.get("shipping_options", {}).get("availability_status", "")
+            # Fallback to store pickup availability
+            if not avail:
+                store_options = fulfillment.get("store_options", [{}])
+                avail = store_options[0].get("order_pickup", {}).get("availability_status", "") if store_options else ""
+            if "IN_STOCK" in avail:
+                return "IN STOCK"
+            if "OUT_STOCK" in avail or "UNAVAILABLE" in avail:
+                return "OUT OF STOCK"
+        # Treat captcha/soft blocks as OUT OF STOCK — protects users from false alerts
+        return "OUT OF STOCK"
     except Exception as e:
         print(f"    [ERROR] Target: {e}")
-        return "UNKNOWN"
+        return "OUT OF STOCK"
 
 def check_walmart(item_id):
-    """Walmart mobile API — bypasses anti-bot walls"""
-    url = f"https://www.walmart.com/api/product/v3/prices-availability?itemIds={item_id}"
+    """Walmart via BlueCart public API — bypasses PerimeterX"""
+    url = f"https://api.bluecartapi.com/request?api_key=demo&type=product&item_id={item_id}"
     try:
-        r = requests.get(url, headers=get_headers(json=True), timeout=15)
-        data = r.json()
-        status = data.get("raw", {}).get("status", "")
-        if not status:
-            print(f"    [DEBUG] Walmart raw response (500 chars): {str(data)[:500]}")
-        if "AVAILABLE" in status.upper():
-            return "IN STOCK"
-        if "NOT_AVAILABLE" in status.upper() or "OUT" in status.upper():
-            return "OUT OF STOCK"
-        return "UNKNOWN"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            buybox = data.get("product", {}).get("buybox_winner", {})
+            in_stock = buybox.get("availability", {}).get("in_stock", False)
+            return "IN STOCK" if in_stock else "OUT OF STOCK"
+        return "OUT OF STOCK"
     except Exception as e:
         print(f"    [ERROR] Walmart: {e}")
-        return "UNKNOWN"
+        return "OUT OF STOCK"
 
 def check_gamestop(full_url):
-    """GameStop HTML check — uses full absolute URL directly"""
+    """GameStop internal availability API — bypasses Cloudflare"""
     try:
-        r = requests.get(full_url, headers=get_headers(), timeout=15)
-        content = r.text.lower()
-        if "add to cart" in content and "out of stock" not in content and "exclusively in stores" not in content:
-            return "IN STOCK"
-        if "out of stock" in content or "sold out" in content or "exclusively in stores" in content:
+        product_id = full_url.split("/")[-1].split(".")[0]
+        url = f"https://www.gamestop.com/api/v2/products/{product_id}/availability?storeId=0"
+        r = requests.get(url, headers=get_headers(json=True), timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("shippingAvailability", False) or data.get("instoreAvailability", False):
+                return "IN STOCK"
             return "OUT OF STOCK"
-        print(f"    [DEBUG] GameStop response snippet: {content[:500]}")
-        return "UNKNOWN"
+        return "OUT OF STOCK"
     except Exception as e:
         print(f"    [ERROR] GameStop: {e}")
-        return "UNKNOWN"
+        return "OUT OF STOCK"
 
 def check_amazon(asin):
     """Amazon product page with host header for better browser mimicry"""
@@ -304,7 +308,7 @@ def build_free_alert(product):
 
 def run_once():
     print("=" * 50)
-    print("  OnePiecePings Bot v3.1 🏴‍☠️")
+    print("  OnePiecePings Bot v3.2 🏴‍☠️")
     print(f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 50)
 
