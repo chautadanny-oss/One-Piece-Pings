@@ -7,7 +7,7 @@ import random
 from datetime import datetime
 
 # ============================================================
-# ONEPIECEPINGS BOT v3.2
+# ONEPIECEPINGS BOT v3.3
 # - Safe API lookups (no more crashes)
 # - Target deep structural fallback (shipping + store pickup)
 # - Walmart via BlueCart public API (bypasses PerimeterX)
@@ -17,14 +17,16 @@ from datetime import datetime
 # - Discord rate limit handling
 # - Free alert only fires if item is STILL in stock at 30 min
 # - UNKNOWN replaced with safe OUT OF STOCK fallback
+# - Alerts fire to both Whop AND Discord webhooks
 # - Runs 24/7 on GitHub Actions for free
 # ============================================================
 
 CREW_WEBHOOK = os.environ.get("CREW_WEBHOOK", "")
 FREE_WEBHOOK = os.environ.get("FREE_WEBHOOK", "")
+ALERTS_FOR_CREW = os.environ.get("ALERTS_FOR_CREW", "")
+ALERTS_FOR_VAULT = os.environ.get("ALERTS_FOR_VAULT", "")
 
 # --- ROTATING USER AGENTS ---
-# Looks like a different device every run — harder to block
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -62,9 +64,7 @@ def check_target(tcin):
                 p_data.get("fulfillment") or
                 p_data.get("enrichment", {}).get("fulfillment", {}) or {}
             )
-            # Check shipping availability first
             avail = fulfillment.get("shipping_options", {}).get("availability_status", "")
-            # Fallback to store pickup availability
             if not avail:
                 store_options = fulfillment.get("store_options", [{}])
                 avail = store_options[0].get("order_pickup", {}).get("availability_status", "") if store_options else ""
@@ -72,7 +72,6 @@ def check_target(tcin):
                 return "IN STOCK"
             if "OUT_STOCK" in avail or "UNAVAILABLE" in avail:
                 return "OUT OF STOCK"
-        # Treat captcha/soft blocks as OUT OF STOCK — protects users from false alerts
         return "OUT OF STOCK"
     except Exception as e:
         print(f"    [ERROR] Target: {e}")
@@ -121,14 +120,13 @@ def check_amazon(asin):
             return "IN STOCK"
         if "currently unavailable" in content or "out of stock" in content:
             return "OUT OF STOCK"
-        return "UNKNOWN"
+        return "OUT OF STOCK"
     except Exception as e:
         print(f"    [ERROR] Amazon: {e}")
-        return "UNKNOWN"
+        return "OUT OF STOCK"
 
 # ============================================================
 # PRODUCTS TO MONITOR
-# Add new products by copying any block and updating the ID
 # ============================================================
 
 PRODUCTS = [
@@ -220,7 +218,6 @@ def load_state():
     return {}
 
 def save_state(state):
-    """Atomic write — writes temp file first, then replaces. Prevents corruption."""
     temp_file = "state_temp.json"
     try:
         with open(temp_file, "w") as f:
@@ -245,7 +242,6 @@ def send_webhook(webhook_url, payload):
         if r.status_code in [200, 204]:
             print(f"    [✅] Alert sent")
         elif r.status_code == 429:
-            # Discord rate limit — wait and retry once
             retry_after = r.json().get("retry_after", 5)
             print(f"    [⚠️] Rate limited — waiting {retry_after}s then retrying")
             time.sleep(retry_after)
@@ -308,7 +304,7 @@ def build_free_alert(product):
 
 def run_once():
     print("=" * 50)
-    print("  OnePiecePings Bot v3.2 🏴‍☠️")
+    print("  OnePiecePings Bot v3.3 🏴‍☠️")
     print(f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 50)
 
@@ -324,8 +320,9 @@ def run_once():
 
         # New restock detected
         if status == "IN STOCK" and last_status != "IN STOCK":
-            print(f"  [🚨] RESTOCK! Firing Crew alert...")
+            print(f"  [🚨] RESTOCK! Firing Crew alerts...")
             send_webhook(CREW_WEBHOOK, build_crew_alert(product))
+            send_webhook(ALERTS_FOR_CREW, build_crew_alert(product))
             state[f"{pid}_free_send_at"] = time.time() + (30 * 60)
             print(f"  [⏳] Free alert queued for 30 minutes")
 
@@ -333,8 +330,9 @@ def run_once():
         free_send_at = state.get(f"{pid}_free_send_at")
         if free_send_at and time.time() >= float(free_send_at):
             if status == "IN STOCK":
-                print(f"  [📢] Item still in stock — sending free alert...")
+                print(f"  [📢] Item still in stock — sending free alerts...")
                 send_webhook(FREE_WEBHOOK, build_free_alert(product))
+                send_webhook(ALERTS_FOR_VAULT, build_free_alert(product))
             else:
                 print(f"  [⏳] Free alert cancelled — item sold out before 30 min mark")
             del state[f"{pid}_free_send_at"]
