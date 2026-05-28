@@ -7,7 +7,7 @@ import random
 from datetime import datetime
 
 # ============================================================
-# ONEPIECEPINGS BOT v3.3
+# ONEPIECEPINGS BOT v3.4
 # - Safe API lookups (no more crashes)
 # - Target deep structural fallback (shipping + store pickup)
 # - Walmart via BlueCart public API (bypasses PerimeterX)
@@ -15,14 +15,16 @@ from datetime import datetime
 # - Rotating user agents (avoids IP bans)
 # - Atomic state saving (no corruption)
 # - Discord rate limit handling
-# - Free alert only fires if item is STILL in stock at 30 min
+# - Free alert only fires if item is STILL in stock at 20 min
+# - Free alert includes store page URL (no direct checkout)
+# - Crew alert unchanged — instant + direct checkout link
 # - UNKNOWN replaced with safe OUT OF STOCK fallback
 # - Alerts fire to both Whop AND Discord webhooks
 # - Runs 24/7 on GitHub Actions for free
 # ============================================================
 
-CREW_WEBHOOK = os.environ.get("CREW_WEBHOOK", "")
-FREE_WEBHOOK = os.environ.get("FREE_WEBHOOK", "")
+CREW_WEBHOOK    = os.environ.get("CREW_WEBHOOK", "")
+FREE_WEBHOOK    = os.environ.get("FREE_WEBHOOK", "")
 ALERTS_FOR_CREW = os.environ.get("ALERTS_FOR_CREW", "")
 ALERTS_FOR_VAULT = os.environ.get("ALERTS_FOR_VAULT", "")
 
@@ -50,7 +52,6 @@ def get_headers(json=False):
 # ============================================================
 
 def check_target(tcin):
-    """Target internal API with deep structural fallback"""
     url = (
         f"https://redsky.target.com/redsky_aggregations/v1/web/pdp_client_v1"
         f"?key=9f36aeafbe60771e321a7cc95a78140772ab3e96&tcin={tcin}&pricing_store_id=3991"
@@ -78,7 +79,6 @@ def check_target(tcin):
         return "OUT OF STOCK"
 
 def check_walmart(item_id):
-    """Walmart via BlueCart public API — bypasses PerimeterX"""
     url = f"https://api.bluecartapi.com/request?api_key=demo&type=product&item_id={item_id}"
     try:
         r = requests.get(url, timeout=10)
@@ -93,7 +93,6 @@ def check_walmart(item_id):
         return "OUT OF STOCK"
 
 def check_gamestop(full_url):
-    """GameStop internal availability API — bypasses Cloudflare"""
     try:
         product_id = full_url.split("/")[-1].split(".")[0]
         url = f"https://www.gamestop.com/api/v2/products/{product_id}/availability?storeId=0"
@@ -109,7 +108,6 @@ def check_gamestop(full_url):
         return "OUT OF STOCK"
 
 def check_amazon(asin):
-    """Amazon product page with host header for better browser mimicry"""
     url = f"https://www.amazon.com/dp/{asin}"
     try:
         headers = get_headers()
@@ -203,7 +201,7 @@ PRODUCTS = [
 ]
 
 # ============================================================
-# STATE MANAGEMENT — atomic save, no corruption
+# STATE MANAGEMENT
 # ============================================================
 
 STATE_FILE = "state.json"
@@ -230,7 +228,7 @@ def get_product_id(product):
     return hashlib.md5(f"{product['retailer']}-{product['name']}".encode()).hexdigest()
 
 # ============================================================
-# DISCORD ALERTS — with rate limit handling
+# DISCORD ALERTS
 # ============================================================
 
 def send_webhook(webhook_url, payload):
@@ -262,12 +260,12 @@ def build_crew_alert(product):
             "title": "🚨 CREW ALERT",
             "color": 0xFFD700,
             "fields": [
-                {"name": "📦 Product", "value": product["name"], "inline": True},
-                {"name": "🏪 Retailer", "value": product["retailer"], "inline": True},
-                {"name": "💰 Price", "value": product["price"], "inline": True},
-                {"name": "✅ Status", "value": "IN STOCK", "inline": True},
-                {"name": "📊 Stock Level", "value": "Limited — move fast", "inline": True},
-                {"name": "⏰ Detected", "value": now, "inline": True},
+                {"name": "📦 Product",     "value": product["name"],      "inline": True},
+                {"name": "🏪 Retailer",    "value": product["retailer"],  "inline": True},
+                {"name": "💰 Price",       "value": product["price"],     "inline": True},
+                {"name": "✅ Status",      "value": "IN STOCK",           "inline": True},
+                {"name": "📊 Stock Level", "value": "Limited — move fast","inline": True},
+                {"name": "⏰ Detected",    "value": now,                  "inline": True},
                 {"name": "🔗 Direct Link", "value": f"[Click to checkout]({product['url']})", "inline": False},
             ],
             "footer": {"text": "OnePiecePings Crew • You got here first ⚡"},
@@ -281,12 +279,13 @@ def build_free_alert(product):
             "title": "🔔 RESTOCK ALERT",
             "color": 0x3498DB,
             "fields": [
-                {"name": "📦 Product", "value": product["name"], "inline": True},
-                {"name": "🏪 Retailer", "value": product["retailer"], "inline": True},
-                {"name": "💰 Price", "value": product["price"], "inline": True},
-                {"name": "✅ Status", "value": "IN STOCK", "inline": True},
-                {"name": "📊 Stock Level", "value": "Limited", "inline": True},
-                {"name": "🕐 Heads up", "value": "This drop went live 30 minutes ago.", "inline": False},
+                {"name": "📦 Product",     "value": product["name"],     "inline": True},
+                {"name": "🏪 Retailer",    "value": product["retailer"], "inline": True},
+                {"name": "💰 Price",       "value": product["price"],    "inline": True},
+                {"name": "✅ Status",      "value": "IN STOCK",          "inline": True},
+                {"name": "📊 Stock Level", "value": "Limited",           "inline": True},
+                {"name": "🕐 Heads up",   "value": "This drop went live 20 minutes ago.", "inline": False},
+                {"name": "🛒 Store Page", "value": f"[View Product]({product['url']})", "inline": False},
                 {
                     "name": "⚡ Want to be first next time?",
                     "value": "Upgrade to **Crew** — instant alerts + direct checkout links the second drops go live.\n👉 [Join Crew on OnePiecePings](https://whop.com/onepiecepings)",
@@ -304,7 +303,7 @@ def build_free_alert(product):
 
 def run_once():
     print("=" * 50)
-    print("  OnePiecePings Bot v3.3 🏴‍☠️")
+    print("  OnePiecePings Bot v3.4 🏴‍☠️")
     print(f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 50)
 
@@ -318,15 +317,13 @@ def run_once():
 
         print(f"  [{status}] {product['retailer']} — {product['name']}")
 
-        # New restock detected
         if status == "IN STOCK" and last_status != "IN STOCK":
             print(f"  [🚨] RESTOCK! Firing Crew alerts...")
             send_webhook(CREW_WEBHOOK, build_crew_alert(product))
             send_webhook(ALERTS_FOR_CREW, build_crew_alert(product))
-            state[f"{pid}_free_send_at"] = time.time() + (30 * 60)
-            print(f"  [⏳] Free alert queued for 30 minutes")
+            state[f"{pid}_free_send_at"] = time.time() + (20 * 60)
+            print(f"  [⏳] Free alert queued for 20 minutes")
 
-        # Send pending free alert if due — only if item is STILL in stock
         free_send_at = state.get(f"{pid}_free_send_at")
         if free_send_at and time.time() >= float(free_send_at):
             if status == "IN STOCK":
@@ -334,7 +331,7 @@ def run_once():
                 send_webhook(FREE_WEBHOOK, build_free_alert(product))
                 send_webhook(ALERTS_FOR_VAULT, build_free_alert(product))
             else:
-                print(f"  [⏳] Free alert cancelled — item sold out before 30 min mark")
+                print(f"  [⏳] Free alert cancelled — item sold out before 20 min mark")
             del state[f"{pid}_free_send_at"]
 
         state[pid] = status
